@@ -8,7 +8,7 @@ import time
 
 from dash import html
 from dash.dash_table import DataTable
-from dash.dcc import Checklist, Store
+from dash.dcc import Checklist, Download, Dropdown, Store
 from dash.dcc import Input as DCC_Input
 from dash.development.base_component import Component
 from dash.html import H2, H3, Br, Button, Details, Div, Label, Summary
@@ -17,6 +17,7 @@ import yaml
 from ml_peg.analysis.utils.utils import Thresholds
 from ml_peg.app.utils.register_callbacks import (
     register_category_table_callbacks,
+    register_download_callbacks,
     register_normalization_callbacks,
     register_summary_table_callbacks,
     register_weight_callbacks,
@@ -135,6 +136,8 @@ def build_weight_components(
     table: DataTable,
     *,
     use_thresholds: bool = False,
+    include_download_controls: bool = True,
+    download_anchor: str = "center",
     column_widths: dict[str, int] | None = None,
     thresholds: Thresholds | None = None,
 ) -> Div:
@@ -151,6 +154,10 @@ def build_weight_components(
         Whether this table also exposes normalization thresholds. When True,
         weight callbacks will reuse the raw-data store and normalization store to
         recompute Scores consistently.
+    include_download_controls
+        Whether to render download controls inside this component.
+    download_anchor
+        Position of download controls when rendered. One of `"center"` or `"top"`.
     column_widths
         Optional mapping of table column IDs to pixel widths used to align the
         inputs with the rendered table.
@@ -277,6 +284,7 @@ def build_weight_components(
             "rowGap": "4px",
             "marginTop": "-5px",
             "padding": "2px 4px",
+            "paddingRight": "130px" if include_download_controls else "4px",
             "backgroundColor": "#f8f9fa",
             "border": "1px solid transparent"
             if header == "Metric Weights"
@@ -288,9 +296,21 @@ def build_weight_components(
         },
     )
 
+    panel_children: list[Component] = [container]
+    if include_download_controls:
+        panel_children.insert(
+            0,
+            build_download_controls(table.id, anchor=download_anchor),
+        )
+
+    panel = Div(
+        panel_children,
+        style={"position": "relative"} if include_download_controls else None,
+    )
+
     layout = [
         Br(),
-        container,
+        panel,
         Store(
             id=f"{table.id}-weight-store",
             storage_type="session",
@@ -327,7 +347,84 @@ def build_weight_components(
             default_weights=getattr(table, "weights", None),
         )
 
+    register_download_callbacks(table.id)
+
     return Div(layout)
+
+
+def build_download_controls(table_id: str, anchor: str = "center") -> Div:
+    """
+    Build minimal table download controls.
+
+    Parameters
+    ----------
+    table_id
+        ID of the table to export.
+    anchor
+        Vertical anchor for controls: `"center"` or `"top"`.
+
+    Returns
+    -------
+    Div
+        Download controls and target components.
+    """
+    if anchor == "top":
+        top_style = {
+            "top": "10px",
+            "transform": "none",
+        }
+    else:
+        top_style = {
+            "top": "50%",
+            "transform": "translateY(-50%)",
+        }
+
+    return Div(
+        [
+            Dropdown(
+                id=f"{table_id}-download-format",
+                className="table-download-format",
+                options=[
+                    {"label": "CSV", "value": "csv"},
+                    {"label": "PNG", "value": "png"},
+                    {"label": "SVG", "value": "svg"},
+                ],
+                value="csv",
+                clearable=False,
+                searchable=False,
+                style={
+                    "width": "72px",
+                    "fontSize": "11px",
+                },
+            ),
+            Button(
+                "Download",
+                id=f"{table_id}-download-button",
+                n_clicks=0,
+                style={
+                    "width": "72px",
+                    "padding": "5px 8px",
+                    "fontSize": "11px",
+                    "borderRadius": "4px",
+                    "border": "1px solid #6c757d",
+                    "backgroundColor": "#ffffff",
+                    "cursor": "pointer",
+                },
+            ),
+            Download(id=f"{table_id}-download"),
+            Store(id=f"{table_id}-download-request", storage_type="memory"),
+        ],
+        style={
+            "position": "absolute",
+            "right": "12px",
+            "zIndex": "10",
+            "display": "flex",
+            "flexDirection": "column",
+            "alignItems": "flex-end",
+            "gap": "6px",
+            **top_style,
+        },
+    )
 
 
 def build_faqs() -> Div:
@@ -601,6 +698,7 @@ def build_test_layout(
     )
 
     # Inline normalization thresholds when metadata is supplied
+    threshold_controls = None
     if thresholds is not None:
         reserved = {"MLIP", "Score", "id"}
         metric_columns = [
@@ -632,6 +730,8 @@ def build_test_layout(
         header="Metric Weights",
         table=table,
         use_thresholds=True,
+        include_download_controls=thresholds is None,
+        download_anchor="top",
         column_widths=column_widths,
         thresholds=thresholds,
     )
@@ -653,14 +753,17 @@ def build_test_layout(
         layout_contents.append(
             Div(
                 [
+                    build_download_controls(table.id, anchor="top"),
                     Div(threshold_controls, style={"marginBottom": "0px"}),
                     Div(compact_weights, style={"marginTop": "0"}),
                 ],
                 style={
+                    "position": "relative",
                     "backgroundColor": "#f8f9fa",
                     "border": "1px solid #dee2e6",
                     "borderRadius": "6px",
                     "padding": "0px 0px 0px 0px",  # top right bottom left
+                    "paddingRight": "130px",
                     "marginTop": "-5px",
                     "boxSizing": "border-box",
                     "width": "100%",
