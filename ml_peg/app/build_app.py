@@ -5,10 +5,10 @@ from __future__ import annotations
 from importlib import import_module
 import warnings
 
-from dash import Dash, Input, Output, callback
+from dash import Dash, Input, Output, callback, callback_context
 from dash.dash_table import DataTable
-from dash.dcc import Loading, Store, Tab, Tabs
-from dash.html import H1, H3, Div
+from dash.dcc import Dropdown, Loading, Store, Tab, Tabs
+from dash.html import H1, H3, Button, Details, Div, Summary
 from yaml import safe_load
 
 from ml_peg.analysis.utils.utils import calc_table_scores, get_table_style
@@ -27,6 +27,7 @@ from ml_peg.app.utils.register_callbacks import register_benchmark_to_category_c
 from ml_peg.app.utils.utils import (
     build_level_of_theory_warnings,
     calculate_column_widths,
+    get_framework_config,
     load_model_registry_configs,
     sig_fig_format,
 )
@@ -39,7 +40,11 @@ MODELS = get_model_names(current_models)
 
 def get_all_tests(
     category: str = "*",
-) -> tuple[dict[str, dict[str, list[Div]]], dict[str, dict[str, DataTable]]]:
+) -> tuple[
+    dict[str, dict[str, list[Div]]],
+    dict[str, dict[str, DataTable]],
+    dict[str, dict[str, str]],
+]:
     """
     Get layout and register callbacks for all categories.
 
@@ -50,8 +55,8 @@ def get_all_tests(
 
     Returns
     -------
-    tuple[dict[str, dict[str, list[Div]]], dict[str, dict[str, DataTable]]]
-        Layouts and tables for all categories.
+    tuple
+        Layouts, tables, and framework IDs for all categories.
     """
     # Find Python files e.g. app_OC157.py in mlip_tesing.app module.
     # We will get the category from the parent's parent directory
@@ -59,6 +64,7 @@ def get_all_tests(
     tests = APP_ROOT.glob(f"{category}/*/app*.py")
     layouts = {}
     tables = {}
+    frameworks = {}
 
     # Build all layouts, and register all callbacks to main app.
     for test in tests:
@@ -75,8 +81,10 @@ def get_all_tests(
             if category_name not in layouts:
                 layouts[category_name] = {}
                 tables[category_name] = {}
+                frameworks[category_name] = {}
             layouts[category_name][test_app.name] = test_app.layout
             tables[category_name][test_app.name] = test_app.table
+            frameworks[category_name][test_app.name] = test_app.framework_id
         except FileNotFoundError as err:
             warnings.warn(
                 f"Unable to load layout for {test_name} in {category_name} category. "
@@ -96,13 +104,19 @@ def get_all_tests(
             )
             continue
 
-    return layouts, tables
+    return layouts, tables, frameworks
 
 
 def build_category(
     all_layouts: dict[str, dict[str, list[Div]]],
     all_tables: dict[str, dict[str, DataTable]],
-) -> tuple[dict[str, list[Div]], dict[str, DataTable]]:
+    all_frameworks: dict[str, dict[str, str]],
+) -> tuple[
+    dict[str, dict[str, object]],
+    dict[str, DataTable],
+    dict[str, float],
+    set[str],
+]:
     """
     Build category layouts and summary tables.
 
@@ -112,16 +126,19 @@ def build_category(
         Layouts of all tests, grouped by category.
     all_tables
         Tables for all tests, grouped by category.
+    all_frameworks
+        Framework IDs for all tests, grouped by category.
 
     Returns
     -------
-    tuple[dict[str, list[Div]], dict[str, DataTable]]
-        Dictionary of category layouts, and dictionary of category summary tables.
+    tuple
+        Category view metadata, category summary tables, category weights, and all
+        discovered framework IDs.
     """
-    # Take all tables in category, build new table, and set layout
-    category_layouts = {}
+    category_views = {}
     category_tables = {}
     category_weights = {}
+    framework_ids: set[str] = set()
 
     # `category` corresponds to the category's directory name
     # We will use the loaded `category_title` for IDs/dictionary keys returned
@@ -160,33 +177,25 @@ def build_category(
             column_widths=getattr(summary_table, "column_widths", None),
         )
 
-        # Build full layout with summary table, weight controls, and test layouts
-        category_layouts[category_title] = Div(
-            [
-                H1(category_title),
-                H3(category_descrip),
-                summary_table,
-                Store(
-                    id=f"{category_title}-summary-table-computed-store",
-                    storage_type="session",
-                    data=summary_table.data,
-                ),
-                weight_components,
-                Div(
-                    [
-                        Div(
-                            style={
-                                "width": "100%",
-                                "height": "1px",
-                                "backgroundColor": "#a7adb3",
-                            }
-                        ),
-                    ],
-                    style={"margin": "32px 0 24px"},
-                ),
-                Div([all_layouts[category][test] for test in all_layouts[category]]),
-            ]
-        )
+        test_entries = []
+        for test_name in all_layouts[category]:
+            framework_id = all_frameworks[category][test_name]
+            framework_ids.add(framework_id)
+            test_entries.append(
+                {
+                    "name": test_name,
+                    "framework_id": framework_id,
+                    "layout": all_layouts[category][test_name],
+                }
+            )
+
+        category_views[category_title] = {
+            "title": category_title,
+            "description": category_descrip,
+            "summary_table": summary_table,
+            "weight_components": weight_components,
+            "tests": test_entries,
+        }
 
         # Register benchmark table -> category table callbacks
         # Category summary table columns add "Score" to name for clarity
@@ -198,7 +207,113 @@ def build_category(
                 model_name_map=getattr(benchmark_table, "model_name_map", None),
             )
 
-    return category_layouts, category_tables, category_weights
+    return category_views, category_tables, category_weights, framework_ids
+
+
+def build_category_tab_layout(
+    category_view: dict[str, object],
+    selected_frameworks: list[str],
+) -> Div:
+    """
+    Build category tab layout, optionally filtering benchmark sections by framework.
+
+    Parameters
+    ----------
+    category_view
+        Category metadata including summary table, controls, and benchmark layouts.
+    selected_frameworks
+        Framework IDs to display in benchmark sections.
+
+    Returns
+    -------
+    Div
+        Category tab layout.
+    """
+    category_title = category_view["title"]
+    category_description = category_view["description"]
+    summary_table = category_view["summary_table"]
+    weight_components = category_view["weight_components"]
+    tests = category_view["tests"]
+
+    selected_framework_set = set(selected_frameworks)
+    selected_tests = [
+        test for test in tests if test["framework_id"] in selected_framework_set
+    ]
+
+    if not selected_frameworks:
+        filter_notice = Div(
+            "No frameworks selected. Choose one or more frameworks above.",
+            style={
+                "fontSize": "13px",
+                "fontStyle": "italic",
+                "color": "#64748b",
+                "marginTop": "12px",
+            },
+        )
+    else:
+        if len(selected_tests) == len(tests):
+            filter_notice = None
+        else:
+            selected_in_category = {
+                test["framework_id"]
+                for test in tests
+                if test["framework_id"] in selected_framework_set
+            }
+            framework_labels = [
+                get_framework_config(framework_id)["label"]
+                for framework_id in sorted(selected_in_category)
+            ]
+            filter_notice = Div(
+                f"Showing benchmarks from: {', '.join(framework_labels)}.",
+                style={
+                    "fontSize": "13px",
+                    "fontStyle": "italic",
+                    "color": "#64748b",
+                    "marginTop": "12px",
+                },
+            )
+
+    if selected_tests:
+        benchmark_section = Div([test["layout"] for test in selected_tests])
+    else:
+        benchmark_section = Div(
+            "No benchmarks are available for the selected framework filters.",
+            style={
+                "padding": "12px",
+                "border": "1px dashed #94a3b8",
+                "borderRadius": "6px",
+                "color": "#64748b",
+                "fontStyle": "italic",
+            },
+        )
+
+    return Div(
+        [
+            H1(category_title),
+            H3(category_description),
+            summary_table,
+            Store(
+                id=f"{category_title}-summary-table-computed-store",
+                storage_type="session",
+                data=summary_table.data,
+            ),
+            weight_components,
+            filter_notice,
+            Div(
+                [
+                    Div(
+                        style={
+                            "width": "100%",
+                            "height": "1px",
+                            "backgroundColor": "#a7adb3",
+                        }
+                    ),
+                ],
+                style={"margin": "32px 0 24px"},
+            ),
+            benchmark_section,
+        ]
+    )
 
 
 def build_summary_table(
@@ -353,9 +468,10 @@ def build_summary_table(
 
 def build_tabs(
     full_app: Dash,
-    layouts: dict[str, list[Div]],
+    category_views: dict[str, dict[str, object]],
     summary_table: DataTable,
     weight_components: Div,
+    framework_options: list[dict[str, str]],
 ) -> None:
     """
     Build tab layouts and summary tab.
@@ -364,16 +480,79 @@ def build_tabs(
     ----------
     full_app
         Full application with all sub-apps.
-    layouts
-        Layouts for all tabs.
+    category_views
+        Category metadata required to render tab content.
     summary_table
         Summary table with score from each category.
     weight_components
         Weight sliders, text boxes and reset button.
+    framework_options
+        Dropdown options for global framework filter.
     """
     all_tabs = [Tab(label="Summary", value="summary-tab", id="summary-tab")] + [
-        Tab(label=category_name, value=category_name) for category_name in layouts
+        Tab(label=category_name, value=category_name)
+        for category_name in category_views
     ]
+    framework_filter = Details(
+        [
+            Summary(
+                "Benchmark framework",
+                style={"cursor": "pointer", "fontWeight": "bold", "padding": "5px"},
+            ),
+            Div(
+                [
+                    Div(
+                        [
+                            Button(
+                                "Select all",
+                                id="framework-filter-select-all",
+                                n_clicks=0,
+                                style={
+                                    "padding": "4px 10px",
+                                    "fontSize": "12px",
+                                    "borderRadius": "4px",
+                                    "border": "1px solid #cbd5e1",
+                                    "backgroundColor": "#f8fafc",
+                                    "cursor": "pointer",
+                                },
+                            ),
+                            Button(
+                                "Deselect all",
+                                id="framework-filter-deselect-all",
+                                n_clicks=0,
+                                style={
+                                    "padding": "4px 10px",
+                                    "fontSize": "12px",
+                                    "borderRadius": "4px",
+                                    "border": "1px solid #cbd5e1",
+                                    "backgroundColor": "#ffffff",
+                                    "cursor": "pointer",
+                                },
+                            ),
+                        ],
+                        style={
+                            "display": "flex",
+                            "gap": "8px",
+                            "marginBottom": "8px",
+                        },
+                    ),
+                    Dropdown(
+                        id="framework-filter",
+                        options=framework_options,
+                        value=[option["value"] for option in framework_options],
+                        multi=True,
+                        closeOnSelect=False,
+                        placeholder="Select visible frameworks",
+                        style={"fontSize": "13px"},
+                    ),
+                ],
+                style={"padding": "8px 12px"},
+            ),
+        ],
+        id="framework-filter-details",
+        open=True,
+        style={"marginBottom": "8px", "fontSize": "13px"},
+    )
 
     tabs_layout = [
         build_onboarding_modal(),
@@ -382,6 +561,7 @@ def build_tabs(
             [
                 H1("ML-PEG"),
                 Tabs(id="all-tabs", value="summary-tab", children=all_tabs),
+                framework_filter,
                 Loading(
                     Div(id="tabs-content"),
                     type="circle",
@@ -412,8 +592,33 @@ def build_tabs(
         style={"display": "flex", "flexDirection": "column", "minHeight": "100vh"},
     )
 
-    @callback(Output("tabs-content", "children"), Input("all-tabs", "value"))
-    def select_tab(tab) -> Div:
+    @callback(
+        Output("framework-filter-details", "open"),
+        Input("all-tabs", "value"),
+        prevent_initial_call=False,
+    )
+    def toggle_framework_filter_panel(tab: str) -> bool:
+        """
+        Expand the framework filter panel on the summary tab only.
+
+        Parameters
+        ----------
+        tab
+            Currently selected tab identifier.
+
+        Returns
+        -------
+        bool
+            ``True`` when the summary tab is active, otherwise ``False``.
+        """
+        return tab == "summary-tab"
+
+    @callback(
+        Output("tabs-content", "children"),
+        Input("all-tabs", "value"),
+        Input("framework-filter", "value"),
+    )
+    def select_tab(tab: str, framework_filter: list[str]) -> Div:
         """
         Select tab contents to be displayed.
 
@@ -421,13 +626,59 @@ def build_tabs(
         ----------
         tab
             Name of tab selected.
+        framework_filter
+            Selected framework IDs from the filter dropdown.
 
         Returns
         -------
         Div
             Summary or tab contents to be displayed.
         """
+        all_framework_values = [option["value"] for option in framework_options]
+        all_framework_set = set(all_framework_values)
+        active_frameworks = framework_filter
+        active_framework_set = set(active_frameworks)
+
         if tab == "summary-tab":
+            filter_notice = None
+            if not active_framework_set:
+                filter_notice = Div(
+                    (
+                        "No frameworks selected for category tabs. "
+                        "Summary scores still include all benchmarks."
+                    ),
+                    style={
+                        "marginTop": "12px",
+                        "padding": "8px 10px",
+                        "fontSize": "13px",
+                        "color": "#475569",
+                        "backgroundColor": "#f8fafc",
+                        "border": "1px solid #cbd5e1",
+                        "borderRadius": "6px",
+                    },
+                )
+            elif active_framework_set != all_framework_set:
+                framework_labels = [
+                    get_framework_config(framework_id)["label"]
+                    for framework_id in sorted(active_framework_set)
+                ]
+                filter_notice = Div(
+                    (
+                        f"Framework filter ({', '.join(framework_labels)}) only "
+                        "changes which "
+                        "benchmark sections are shown in category tabs. Summary scores "
+                        "still include all benchmarks."
+                    ),
+                    style={
+                        "marginTop": "12px",
+                        "padding": "8px 10px",
+                        "fontSize": "13px",
+                        "color": "#475569",
+                        "backgroundColor": "#f8fafc",
+                        "border": "1px solid #cbd5e1",
+                        "borderRadius": "6px",
+                    },
+                )
             return Div(
                 [
                     H1("Benchmarks Summary"),
@@ -437,10 +688,41 @@ def build_tabs(
                         id="summary-table-scores-store",
                         storage_type="session",
                     ),
+                    filter_notice,
                     build_faqs(),
                 ]
             )
-        return Div([layouts[tab]])
+        return Div([build_category_tab_layout(category_views[tab], active_frameworks)])
+
+    @callback(
+        Output("framework-filter", "value"),
+        Input("framework-filter-select-all", "n_clicks"),
+        Input("framework-filter-deselect-all", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def update_framework_filter_selection(
+        select_all_clicks: int,
+        deselect_all_clicks: int,
+    ) -> list[str]:
+        """
+        Select or clear framework selections from quick-action buttons.
+
+        Parameters
+        ----------
+        select_all_clicks
+            Number of clicks on the select-all button.
+        deselect_all_clicks
+            Number of clicks on the deselect-all button.
+
+        Returns
+        -------
+        list[str]
+            Updated selected framework IDs.
+        """
+        trigger_id = callback_context.triggered_id
+        if trigger_id == "framework-filter-select-all":
+            return [option["value"] for option in framework_options]
+        return []
 
 
 def build_full_app(full_app: Dash, category: str = "*") -> None:
@@ -455,13 +737,15 @@ def build_full_app(full_app: Dash, category: str = "*") -> None:
         Category to build app for. Default is `*`, corresponding to all categories.
     """
     # Get layouts and tables for each test, grouped by categories
-    all_layouts, all_tables = get_all_tests(category=category)
+    all_layouts, all_tables, all_frameworks = get_all_tests(category=category)
 
     if not all_layouts:
         raise ValueError("No tests were built successfully")
 
     # Combine tests into categories and create category summary
-    cat_layouts, cat_tables, cat_weights = build_category(all_layouts, all_tables)
+    cat_views, cat_tables, cat_weights, framework_ids = build_category(
+        all_layouts, all_tables, all_frameworks
+    )
     # Build overall summary table
     summary_table = build_summary_table(cat_tables, weights=cat_weights)
     weight_components = build_weight_components(
@@ -469,6 +753,16 @@ def build_full_app(full_app: Dash, category: str = "*") -> None:
         table=summary_table,
         column_widths=summary_table.column_widths,
     )
+    framework_options = []
+    for framework_id in sorted(framework_ids):
+        framework_label = get_framework_config(framework_id)["label"]
+        framework_options.append({"label": framework_label, "value": framework_id})
     # Build summary and category tabs
-    build_tabs(full_app, cat_layouts, summary_table, weight_components)
+    build_tabs(
+        full_app,
+        cat_views,
+        summary_table,
+        weight_components,
+        framework_options,
+    )
     register_onboarding_callbacks()
