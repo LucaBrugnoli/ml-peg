@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from importlib import import_module
 import warnings
 
-from dash import Dash, Input, Output, callback, callback_context
+from dash import Dash, Input, Output, State, callback, callback_context
 from dash.dash_table import DataTable
 from dash.dcc import Dropdown, Loading, Store, Tab, Tabs
-from dash.html import H1, H3, Button, Details, Div, Summary
+from dash.exceptions import PreventUpdate
+from dash.html import H1, H3, Button, Details, Div, Img, Span, Summary
 from yaml import safe_load
 
-from ml_peg.analysis.utils.utils import calc_table_scores, get_table_style
+from ml_peg.analysis.utils.utils import (
+    calc_table_scores,
+    get_table_style,
+    update_score_style,
+)
 from ml_peg.app import APP_ROOT
 from ml_peg.app.utils.build_components import (
     build_faqs,
@@ -215,14 +221,14 @@ def build_category_tab_layout(
     selected_frameworks: list[str],
 ) -> Div:
     """
-    Build category tab layout, optionally filtering benchmark sections by framework.
+    Build category tab layout and framework-specific scoring notice.
 
     Parameters
     ----------
     category_view
         Category metadata including summary table, controls, and benchmark layouts.
     selected_frameworks
-        Framework IDs to display in benchmark sections.
+        Framework IDs used when recomputing category scores.
 
     Returns
     -------
@@ -234,15 +240,15 @@ def build_category_tab_layout(
     summary_table = category_view["summary_table"]
     weight_components = category_view["weight_components"]
     tests = category_view["tests"]
-
     selected_framework_set = set(selected_frameworks)
-    selected_tests = [
-        test for test in tests if test["framework_id"] in selected_framework_set
-    ]
+    category_frameworks = {test["framework_id"] for test in tests}
 
     if not selected_frameworks:
         filter_notice = Div(
-            "No frameworks selected. Choose one or more frameworks above.",
+            (
+                "All benchmarks are shown. Select one or more frameworks above to "
+                "recompute category scores."
+            ),
             style={
                 "fontSize": "13px",
                 "fontStyle": "italic",
@@ -251,7 +257,7 @@ def build_category_tab_layout(
             },
         )
     else:
-        if len(selected_tests) == len(tests):
+        if selected_framework_set == category_frameworks:
             filter_notice = None
         else:
             selected_in_category = {
@@ -263,29 +269,35 @@ def build_category_tab_layout(
                 get_framework_config(framework_id)["label"]
                 for framework_id in sorted(selected_in_category)
             ]
-            filter_notice = Div(
-                f"Showing benchmarks from: {', '.join(framework_labels)}.",
-                style={
-                    "fontSize": "13px",
-                    "fontStyle": "italic",
-                    "color": "#64748b",
-                    "marginTop": "12px",
-                },
-            )
+            if not framework_labels:
+                filter_notice = Div(
+                    (
+                        "All benchmarks are shown. None of the selected frameworks "
+                        "are present in this category, so category scores are "
+                        "undefined."
+                    ),
+                    style={
+                        "fontSize": "13px",
+                        "fontStyle": "italic",
+                        "color": "#64748b",
+                        "marginTop": "12px",
+                    },
+                )
+            else:
+                filter_notice = Div(
+                    (
+                        "All benchmarks are shown. Category scores are recomputed "
+                        f"from: {', '.join(framework_labels)}."
+                    ),
+                    style={
+                        "fontSize": "13px",
+                        "fontStyle": "italic",
+                        "color": "#64748b",
+                        "marginTop": "12px",
+                    },
+                )
 
-    if selected_tests:
-        benchmark_section = Div([test["layout"] for test in selected_tests])
-    else:
-        benchmark_section = Div(
-            "No benchmarks are available for the selected framework filters.",
-            style={
-                "padding": "12px",
-                "border": "1px dashed #94a3b8",
-                "borderRadius": "6px",
-                "color": "#64748b",
-                "fontStyle": "italic",
-            },
-        )
+    benchmark_section = Div([test["layout"] for test in tests])
 
     return Div(
         [
@@ -466,12 +478,51 @@ def build_summary_table(
     return table
 
 
+def build_framework_dropdown_label(framework_id: str) -> Div:
+    """
+    Build framework dropdown option label with optional logo.
+
+    Parameters
+    ----------
+    framework_id
+        Framework identifier to render.
+
+    Returns
+    -------
+    Div
+        Styled dropdown label content with optional logo.
+    """
+    config = get_framework_config(framework_id)
+    label = config["label"]
+    logo = config.get("logo")
+
+    children: list = []
+    if logo:
+        children.append(
+            Img(
+                src=logo,
+                alt=f"{label} logo",
+                style={
+                    "width": "16px",
+                    "height": "16px",
+                    "borderRadius": "50%",
+                    "objectFit": "cover",
+                },
+            )
+        )
+    children.append(Span(label))
+    return Div(
+        children,
+        style={"display": "flex", "alignItems": "center", "gap": "8px"},
+    )
+
+
 def build_tabs(
     full_app: Dash,
     category_views: dict[str, dict[str, object]],
     summary_table: DataTable,
     weight_components: Div,
-    framework_options: list[dict[str, str]],
+    framework_options: list[dict[str, object]],
 ) -> None:
     """
     Build tab layouts and summary tab.
@@ -542,7 +593,7 @@ def build_tabs(
                         value=[option["value"] for option in framework_options],
                         multi=True,
                         closeOnSelect=False,
-                        placeholder="Select visible frameworks",
+                        placeholder="Select scoring frameworks",
                         style={"fontSize": "13px"},
                     ),
                 ],
@@ -644,8 +695,8 @@ def build_tabs(
             if not active_framework_set:
                 filter_notice = Div(
                     (
-                        "No frameworks selected for category tabs. "
-                        "Summary scores still include all benchmarks."
+                        "No frameworks selected. Category and summary scores are "
+                        "undefined until at least one framework is selected."
                     ),
                     style={
                         "marginTop": "12px",
@@ -664,10 +715,8 @@ def build_tabs(
                 ]
                 filter_notice = Div(
                     (
-                        f"Framework filter ({', '.join(framework_labels)}) only "
-                        "changes which "
-                        "benchmark sections are shown in category tabs. Summary scores "
-                        "still include all benchmarks."
+                        "All benchmarks remain visible. Category/summary scores are "
+                        f"recomputed from: {', '.join(framework_labels)}."
                     ),
                     style={
                         "marginTop": "12px",
@@ -693,6 +742,63 @@ def build_tabs(
                 ]
             )
         return Div([build_category_tab_layout(category_views[tab], active_frameworks)])
+
+    for category_name, category_view in category_views.items():
+        category_table_id = f"{category_name}-summary-table"
+        benchmark_framework_columns = [
+            {
+                "column_id": f"{test['name']} Score",
+                "framework_id": test["framework_id"],
+            }
+            for test in category_view["tests"]
+        ]
+
+        @callback(
+            Output(category_table_id, "data", allow_duplicate=True),
+            Output(category_table_id, "style_data_conditional", allow_duplicate=True),
+            Input("framework-filter", "value"),
+            Input(f"{category_table_id}-computed-store", "data"),
+            State(f"{category_table_id}-weight-store", "data"),
+            prevent_initial_call="initial_duplicate",
+        )
+        def apply_framework_filter_to_category_scores(
+            framework_filter: list[str],
+            category_computed_rows: list[dict] | None,
+            category_weights: dict[str, float] | None,
+            benchmark_columns: list[dict[str, str]] = benchmark_framework_columns,
+        ) -> tuple[list[dict], list[dict]]:
+            """
+            Recompute category summary scores for selected frameworks.
+
+            Parameters
+            ----------
+            framework_filter
+                Selected framework IDs from the filter dropdown.
+            category_computed_rows
+                Latest unfiltered category rows from the computed store.
+            category_weights
+                Current benchmark-column weights for this category summary table.
+            benchmark_columns
+                Mapping of benchmark score columns to framework IDs for the category.
+
+            Returns
+            -------
+            tuple[list[dict], list[dict]]
+                Filtered/recomputed rows and matching conditional style.
+            """
+            if category_computed_rows is None:
+                raise PreventUpdate
+
+            selected_frameworks = set(framework_filter)
+            effective_weights = dict(category_weights or {})
+            for benchmark in benchmark_columns:
+                if benchmark["framework_id"] not in selected_frameworks:
+                    effective_weights[benchmark["column_id"]] = 0.0
+
+            recomputed_rows, style = update_score_style(
+                deepcopy(category_computed_rows), effective_weights
+            )
+            return recomputed_rows, style
 
     @callback(
         Output("framework-filter", "value"),
@@ -756,7 +862,13 @@ def build_full_app(full_app: Dash, category: str = "*") -> None:
     framework_options = []
     for framework_id in sorted(framework_ids):
         framework_label = get_framework_config(framework_id)["label"]
-        framework_options.append({"label": framework_label, "value": framework_id})
+        framework_options.append(
+            {
+                "label": build_framework_dropdown_label(framework_id),
+                "value": framework_id,
+                "search": framework_label,
+            }
+        )
     # Build summary and category tabs
     build_tabs(
         full_app,
